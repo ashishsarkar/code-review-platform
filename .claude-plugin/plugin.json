@@ -1,0 +1,26 @@
+{
+  "name": "codereview",
+  "version": "2.0.0",
+  "description": "Comprehensive code review skills with an orchestrator for triage/routing, 11 specialist sub-skills, auto-fix suggestion patches, interactive chat for PR conversations, and GitHub review submission.",
+  "author": {
+    "name": "Ashish",
+    "url": "https://github.com/ashishsarkar"
+  },
+  "repository": "https://github.com/ashishsarkar/claude-code-review",
+  "license": "MIT",
+  "keywords": [
+    "code-review",
+    "pull-request",
+    "pr-review",
+    "security",
+    "architecture",
+    "performance",
+    "testing",
+    "observability",
+    "coderabbit",
+    "bugbot",
+    "greptile",
+    "google",
+    "best-practices"
+  ]
+}

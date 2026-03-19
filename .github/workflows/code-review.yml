@@ -1,0 +1,267 @@
+name: Auto Code Review & Fix
+
+on:
+  push:
+    branches-ignore:
+      - main
+      - master
+      - release/**
+  pull_request:
+    types: [opened, synchronize, reopened]
+
+permissions:
+  contents: write
+  pull-requests: write
+  issues: write
+
+concurrency:
+  group: code-review-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  # ──────────────────────────────────────────────
+  # Phase 1: Auto Code Review & Fix
+  # ──────────────────────────────────────────────
+  review-and-fix:
+    name: Code Review & Auto-fix
+    runs-on: ubuntu-latest
+    outputs:
+      has_fixes: ${{ steps.auto-fix.outputs.has_fixes }}
+      review_passed: ${{ steps.review.outputs.review_passed }}
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Configure git
+        run: |
+          git config user.name "codereview-bot"
+          git config user.email "codereview-bot@users.noreply.github.com"
+
+      - name: Get changed files
+        id: changed
+        run: |
+          if [ "${{ github.event_name }}" = "pull_request" ]; then
+            BASE="${{ github.event.pull_request.base.sha }}"
+          else
+            BASE="${{ github.event.before }}"
+          fi
+
+          # Handle initial push (no previous commit)
+          if [ "$BASE" = "0000000000000000000000000000000000000000" ]; then
+            BASE=$(git rev-list --max-parents=0 HEAD)
+          fi
+
+          CHANGED_FILES=$(git diff --name-only "$BASE" HEAD | tr '\n' ' ')
+          DIFF=$(git diff "$BASE" HEAD)
+          echo "files=$CHANGED_FILES" >> "$GITHUB_OUTPUT"
+          echo "base=$BASE" >> "$GITHUB_OUTPUT"
+
+          # Save diff to file for the review step
+          git diff "$BASE" HEAD > /tmp/pr-diff.patch
+
+      - name: Run code review
+        id: review
+        env:
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+          DIFF_FILE: /tmp/pr-diff.patch
+          CHANGED_FILES: ${{ steps.changed.outputs.files }}
+        run: |
+          # Run Claude Code with the orchestrator skill
+          # This executes the full review pipeline and outputs findings as JSON
+          npx @anthropic-ai/claude-code --print \
+            "You are running in CI. Read the diff from $DIFF_FILE. \
+             Use the codereview-orchestrator skill to triage, then run the relevant specialist skills. \
+             Output ONLY a JSON object with this schema: \
+             {\"passed\": boolean, \"findings\": [{\"severity\": string, \"category\": string, \"file\": string, \"line\": number, \"description\": string, \"fix_code\": string|null, \"original_code\": string|null}], \"summary\": string} \
+             Set passed=true if no blockers or majors. \
+             For each fixable finding, include fix_code (the replacement) and original_code (what to replace). \
+             For non-fixable findings, set fix_code and original_code to null." \
+            > /tmp/review-output.json 2>/tmp/review-stderr.log || true
+
+          # Parse results
+          if [ -f /tmp/review-output.json ] && jq -e . /tmp/review-output.json > /dev/null 2>&1; then
+            PASSED=$(jq -r '.passed' /tmp/review-output.json)
+            BLOCKER_COUNT=$(jq '[.findings[] | select(.severity == "blocker")] | length' /tmp/review-output.json)
+            MAJOR_COUNT=$(jq '[.findings[] | select(.severity == "major")] | length' /tmp/review-output.json)
+            FIXABLE_COUNT=$(jq '[.findings[] | select(.fix_code != null)] | length' /tmp/review-output.json)
+
+            echo "review_passed=$PASSED" >> "$GITHUB_OUTPUT"
+            echo "blocker_count=$BLOCKER_COUNT" >> "$GITHUB_OUTPUT"
+            echo "major_count=$MAJOR_COUNT" >> "$GITHUB_OUTPUT"
+            echo "fixable_count=$FIXABLE_COUNT" >> "$GITHUB_OUTPUT"
+
+            echo "### Review Results" >> "$GITHUB_STEP_SUMMARY"
+            echo "| Severity | Count |" >> "$GITHUB_STEP_SUMMARY"
+            echo "|----------|-------|" >> "$GITHUB_STEP_SUMMARY"
+            echo "| Blockers | $BLOCKER_COUNT |" >> "$GITHUB_STEP_SUMMARY"
+            echo "| Majors | $MAJOR_COUNT |" >> "$GITHUB_STEP_SUMMARY"
+            echo "| Fixable | $FIXABLE_COUNT |" >> "$GITHUB_STEP_SUMMARY"
+          else
+            echo "review_passed=true" >> "$GITHUB_OUTPUT"
+            echo "fixable_count=0" >> "$GITHUB_OUTPUT"
+            echo "::warning::Code review output was not valid JSON. Skipping."
+          fi
+
+      - name: Apply auto-fixes
+        id: auto-fix
+        if: steps.review.outputs.fixable_count != '0'
+        run: |
+          # Extract and apply each fixable finding
+          FIXES_APPLIED=0
+
+          jq -c '.findings[] | select(.fix_code != null)' /tmp/review-output.json | while read -r finding; do
+            FILE=$(echo "$finding" | jq -r '.file')
+            ORIGINAL=$(echo "$finding" | jq -r '.original_code')
+            FIX=$(echo "$finding" | jq -r '.fix_code')
+            CATEGORY=$(echo "$finding" | jq -r '.category')
+            DESCRIPTION=$(echo "$finding" | jq -r '.description')
+
+            if [ -f "$FILE" ] && [ "$ORIGINAL" != "null" ] && [ "$FIX" != "null" ]; then
+              # Create a temp file with the fix applied
+              python3 -c "
+          import sys
+          with open('$FILE', 'r') as f:
+              content = f.read()
+          original = '''$ORIGINAL'''
+          fix = '''$FIX'''
+          if original in content:
+              content = content.replace(original, fix, 1)
+              with open('$FILE', 'w') as f:
+                  f.write(content)
+              print('APPLIED')
+          else:
+              print('SKIPPED')
+          " && FIXES_APPLIED=$((FIXES_APPLIED + 1))
+            fi
+          done
+
+          # Check if any files were modified
+          if git diff --quiet; then
+            echo "has_fixes=false" >> "$GITHUB_OUTPUT"
+            echo "No fixes were applied." >> "$GITHUB_STEP_SUMMARY"
+          else
+            echo "has_fixes=true" >> "$GITHUB_OUTPUT"
+
+            # Commit and push the fixes
+            git add -A
+            git commit -m "fix: auto-fix code review findings
+
+          Applied automated fixes for issues found during code review.
+          Categories: $(jq -r '[.findings[] | select(.fix_code != null) | .category] | unique | join(", ")' /tmp/review-output.json)
+
+          Co-Authored-By: codereview-bot <codereview-bot@users.noreply.github.com>"
+
+            git push
+
+            echo "### Auto-fixes Applied" >> "$GITHUB_STEP_SUMMARY"
+            echo "Fixes were committed and pushed to the branch." >> "$GITHUB_STEP_SUMMARY"
+          fi
+
+      - name: Post review to PR
+        if: github.event_name == 'pull_request'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          if [ ! -f /tmp/review-output.json ] || ! jq -e . /tmp/review-output.json > /dev/null 2>&1; then
+            echo "No review output to post."
+            exit 0
+          fi
+
+          SUMMARY=$(jq -r '.summary // "Review complete."' /tmp/review-output.json)
+          PASSED=$(jq -r '.passed' /tmp/review-output.json)
+          HAS_FIXES="${{ steps.auto-fix.outputs.has_fixes }}"
+          FINDING_COUNT=$(jq '.findings | length' /tmp/review-output.json)
+
+          # Build the review body
+          BODY="## Automated Code Review\n\n"
+          BODY+="$SUMMARY\n\n"
+
+          if [ "$HAS_FIXES" = "true" ]; then
+            BODY+="### Auto-fixes Applied\n"
+            BODY+="The following issues were automatically fixed and committed:\n\n"
+            jq -r '.findings[] | select(.fix_code != null) | "- **\(.category)**: \(.description) (`\(.file):\(.line)`)"' /tmp/review-output.json | while read -r line; do
+              BODY+="$line\n"
+            done
+            BODY+="\n"
+          fi
+
+          # Add remaining (unfixed) findings
+          UNFIXED=$(jq '[.findings[] | select(.fix_code == null)] | length' /tmp/review-output.json)
+          if [ "$UNFIXED" -gt 0 ]; then
+            BODY+="### Remaining Issues (Manual Fix Required)\n\n"
+            BODY+="| Severity | Category | File | Description |\n"
+            BODY+="|----------|----------|------|-------------|\n"
+            jq -r '.findings[] | select(.fix_code == null) | "| \(.severity) | \(.category) | `\(.file):\(.line)` | \(.description) |"' /tmp/review-output.json | while read -r line; do
+              BODY+="$line\n"
+            done
+          fi
+
+          # Determine review event
+          if [ "$PASSED" = "true" ]; then
+            EVENT="APPROVE"
+          else
+            EVENT="REQUEST_CHANGES"
+          fi
+
+          # Post the review
+          gh pr review "${{ github.event.pull_request.number }}" \
+            --event "$EVENT" \
+            --body "$(echo -e "$BODY")"
+
+  # ──────────────────────────────────────────────
+  # Phase 2: CI/CD Pipeline (runs after review)
+  # ──────────────────────────────────────────────
+  ci-pipeline:
+    name: CI Pipeline
+    needs: review-and-fix
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code (with any auto-fixes)
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.ref }}
+
+      # ── Add your CI steps below ──
+
+      - name: Install dependencies
+        run: |
+          echo "::group::Install dependencies"
+          # Uncomment and modify for your project:
+          # npm ci
+          # pip install -r requirements.txt
+          # go mod download
+          echo "Add your dependency installation here"
+          echo "::endgroup::"
+
+      - name: Lint
+        run: |
+          echo "::group::Lint"
+          # Uncomment and modify for your project:
+          # npm run lint
+          # flake8 .
+          # golangci-lint run
+          echo "Add your linting step here"
+          echo "::endgroup::"
+
+      - name: Test
+        run: |
+          echo "::group::Test"
+          # Uncomment and modify for your project:
+          # npm test
+          # pytest
+          # go test ./...
+          echo "Add your test step here"
+          echo "::endgroup::"
+
+      - name: Build
+        run: |
+          echo "::group::Build"
+          # Uncomment and modify for your project:
+          # npm run build
+          # docker build .
+          # go build ./...
+          echo "Add your build step here"
+          echo "::endgroup::"

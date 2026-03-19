@@ -1,0 +1,15 @@
+{
+  "name": "claude-code-review",
+  "owner": {
+    "name": "Ashish",
+    "url": "https://github.com/ashishsarkar"
+  },
+  "plugins": [
+    {
+      "name": "codereview",
+      "source": "./",
+      "description": "Claude Skills for Code Review",
+      "version": "1.0.0"
+    }
+  ]
+}
