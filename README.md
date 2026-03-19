@@ -78,10 +78,12 @@ This plugin provides a comprehensive code review system modeled after industry-l
 
 ### Marketplace
 
-```
+> **Coming soon** — Marketplace publishing is not yet available. Use manual installation for now.
+
+<!-- ```
 /plugin marketplace add ashishsarkar/claude-code-review
 /plugin install codereview@claude-code-review
-```
+``` -->
 
 ### Manually
 
